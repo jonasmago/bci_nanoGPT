@@ -232,3 +232,38 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## EEG extension (this fork)
+
+Everything new is switched on from one config, `config/experiment.py`, which lists every knob
+with a comment. As shipped it reproduces the original Shakespeare character model above.
+
+```bash
+python train.py config/experiment.py                       # causal Shakespeare (unchanged nanoGPT)
+python train.py config/experiment.py --bidirectional=True  # masked (BERT-style) Shakespeare
+python fill_mask.py --out_dir out-shakespeare-char --text 'To be, or not to be.'   # masked-model demo
+python sample.py --out_dir out-shakespeare-char            # causal-model demo (unchanged)
+```
+
+What was added, file by file:
+
+| file | what it does |
+| --- | --- |
+| `model.py` | `bidirectional` switch (full attention + loss only at masked positions); EEG grids `[B, C, T]` flattened to one sequence; optional RoPE over (t, x, y, z) and optional electrode embeddings |
+| `position.py` | `RotaryPositions` (axial RoPE: time axis, optionally xyz axes) and `FourierXYZ` (sin/cos of electrode xyz added to the token embedding) |
+| `eeg_data.py` | `EEGDataset` (windows from the per-recording npz files, channel subsets, padding) and `make_masked_batch` (random / time-span / whole-channel masking) |
+| `train.py` | reads either `meta.pkl` (text) or `manifest.json` (EEG); masked batches; evaluation on fixed windows; loss reported in bits |
+| `data/eeg_dac_multichannel/prepare.py` | runs the EEG-DAC tokenizer over v8 recordings and writes `codes[C,T]`, electrode xyz, channel names |
+| `fill_mask.py` | demo for masked text checkpoints |
+| `scripts/tokenizer_sensitivity.py` | how far a perturbation of the EEG spreads into neighbouring tokens (sets mask spans) |
+| `scripts/eeg_probe.py` | frozen embeddings + subject-disjoint linear classifier on the codec eval windows |
+
+EEG data: `python data/eeg_dac_multichannel/prepare.py --device cuda:0` tokenizes 48 train / 8 val
+recordings at 8 tokens/s/channel (hop 32 at 256 Hz). An EEG run is the text run with
+`--dataset=eeg_dac_multichannel --bidirectional=True --position_encoding=rope --channel_encoding=<...>`
+plus `block_size >= max_channels * window_frames`; see the comments in `config/experiment.py`.
+
+`channel_encoding` is how a token learns which electrode it belongs to:
+`none` (no channel identity), `learned` (one embedding per channel name), `fourier` (features of xyz
+added to the input), `rope` (xyz rotations inside attention, i.e. 4D RoPE), `rope_fourier` (both).
+Losses are bits per scored token. Causal and masked numbers are different tasks and not comparable.

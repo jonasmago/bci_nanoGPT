@@ -38,6 +38,9 @@ for arg in sys.argv[1:]:
             except (SyntaxError, ValueError):
                 # if that goes wrong, just use the string
                 attempt = val
+            # a string default stays a string (e.g. --rope_dims=32,8,8,8 would otherwise become a tuple)
+            if isinstance(globals()[key], str) and not isinstance(attempt, str):
+                attempt = val
             # ensure the types match ok
             assert type(attempt) == type(globals()[key])
             # cross fingers

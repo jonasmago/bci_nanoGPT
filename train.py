@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+import json
 from contextlib import nullcontext
 
 import numpy as np
@@ -28,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from eeg_data import EEGDataset, make_masked_batch
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -48,12 +50,25 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+# EEG grids only (ignored for text): one example is max_channels x window_frames tokens, block_size >= their product
+window_frames = 64 # frames per channel; the codec gives 8 frames/s
+max_channels = 32 # channels per example; recordings with more contribute a random subset
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+bidirectional = False # False: causal next-token (GPT). True: masked prediction (BERT): MASK some inputs, predict them
+position_encoding = 'learned' # 'learned' wpe table (original) or 'rope' on the time axis (required for EEG xyz)
+channel_encoding = 'none' # EEG electrode identity: none, learned (name table), fourier (xyz features), rope (4D RoPE), rope_fourier
+rope_dims = '' # head dims per axis 't,x,y,z', e.g. '32,8,8,8'; '' = all to time (or 16 each when spatial)
+use_sdpa = True # fused attention kernel; False = the readable manual attention path
+# masking (bidirectional only)
+mask_ratio = 0.15 # fraction of positions masked (BERT 0.15; EEG 0.5)
+mask_strategy = 'random' # random positions | time (spans across all channels) | channel (whole channels) | mixed
+mask_span = 4 # frames per span for 'time'
+eval_mask_strategies = 'random' # comma list of strategies scored at evaluation, e.g. 'time,channel'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -111,59 +126,83 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
+# dataset metadata: text has meta.pkl (vocab_size, maybe stoi/itos), EEG has manifest.json (vocab, tokenizer, channel names)
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+is_eeg = os.path.exists(os.path.join(data_dir, 'manifest.json'))
+if is_eeg:
+    with open(os.path.join(data_dir, 'manifest.json')) as f:
+        meta = json.load(f)
+elif os.path.exists(os.path.join(data_dir, 'meta.pkl')):
+    with open(os.path.join(data_dir, 'meta.pkl'), 'rb') as f:
+        meta = pickle.load(f)
+else:
+    meta = {'vocab_size': 50304} # GPT-2 vocab, 50257 rounded up for efficiency
+mask_token_id = int(meta.get('mask_token_id', -1))
+if bidirectional and mask_token_id < 0:
+    mask_token_id = int(meta['vocab_size']) # MASK is one extra input symbol appended to the vocabulary
+vocab_size = max(int(meta['vocab_size']), mask_token_id + 1)
+print(f"vocab_size = {vocab_size}, mask_token_id = {mask_token_id}")
+if is_eeg and max_channels * window_frames > block_size:
+    raise ValueError("block_size must cover max_channels * window_frames")
+if not is_eeg and channel_encoding != 'none':
+    raise ValueError("channel_encoding needs an EEG dataset")
+if is_eeg:
+    datasets = {split: EEGDataset(data_dir, split, window_frames, max_channels) for split in ('train', 'val')}
+train_rng = torch.Generator().manual_seed(1337 + seed_offset)
+eval_strategies = eval_mask_strategies.split(',') if bidirectional else [None]
+
+# poor man's data loader
+def get_batch(split, generator=None, strategy=None):
+    rng = train_rng if generator is None else generator
+    strategy = mask_strategy if strategy is None else strategy
+    if is_eeg:
+        x, y, kwargs = datasets[split].get_batch(batch_size, bidirectional, mask_token_id,
+                                                 mask_ratio, strategy, mask_span, rng)
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        # We recreate np.memmap every batch to avoid a memory leak, as per
+        # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+        data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+        ix = torch.randint(len(data) - block_size, (batch_size,), generator=rng)
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        if bidirectional: # targets are the original tokens at the masked positions
+            x, y = make_masked_batch(x, None, mask_token_id, mask_ratio, strategy, mask_span, rng)
+        else: # targets are the next tokens
+            y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        kwargs = {}
+    if bidirectional: # which flattened positions are scored; built on CPU so the GPU never has to sync for it
+        kwargs['score_indices'] = (y.reshape(-1) != -1).nonzero(as_tuple=True)[0]
+    def transfer(t):
+        # pin arrays, which allows us to move them to GPU asynchronously (non_blocking=True)
+        return t.pin_memory().to(device, non_blocking=True) if device_type == 'cuda' else t.to(device)
+    kwargs = {k: transfer(v) for k, v in kwargs.items()}
+    kwargs['validate_inputs'] = False # the loader guarantees valid ids and coordinates
+    return transfer(x), transfer(y), kwargs
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=vocab_size, dropout=dropout,
+                  bidirectional=bidirectional, position_encoding=position_encoding, channel_encoding=channel_encoding,
+                  channel_vocab_size=len(meta.get('channel_names', [])) if channel_encoding == 'learned' else 0,
+                  mask_token_id=mask_token_id, rope_dims=rope_dims, use_sdpa=use_sdpa) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
+              'bidirectional', 'position_encoding', 'channel_encoding', 'channel_vocab_size', 'mask_token_id', 'rope_dims']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -212,18 +251,26 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+# the loss is cross-entropy in nats; we print it in bits (/ ln 2) per scored token
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+        nll_total, count_total = 0.0, 0
+        for strategy in eval_strategies:
+            rng = torch.Generator().manual_seed(2026) # the same windows and masks at every evaluation, in every run
+            nll, count = 0.0, 0
+            for k in range(eval_iters):
+                X, Y, kwargs = get_batch(split, rng, strategy)
+                with ctx:
+                    logits, loss = model(X, Y, masked_only=bidirectional, **kwargs)
+                n = int((Y != -1).sum())
+                nll, count = nll + loss.item() * n, count + n
+            if strategy is not None:
+                out[f'{split}/{strategy}'] = nll / count
+            nll_total, count_total = nll_total + nll, count_total + count
+        out[split] = nll_total / count_total
     model.train()
     return out
 
@@ -247,7 +294,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, batch_kwargs = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -262,12 +309,15 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']/math.log(2):.4f}, val loss {losses['val']/math.log(2):.4f} bits/token"
+              + ''.join(f", val/{s} {losses[f'val/{s}']/math.log(2):.4f}" for s in eval_strategies if s is not None))
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/bits": losses['train'] / math.log(2),
+                "val/bits": losses['val'] / math.log(2),
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
@@ -281,6 +331,7 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'dataset_meta': meta, # vocab / tokenizer / channel names the model was trained with
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -297,10 +348,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, masked_only=bidirectional, **batch_kwargs)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y, batch_kwargs = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -324,7 +375,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf/math.log(2):.4f} bits/token, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

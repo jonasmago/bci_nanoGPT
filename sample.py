@@ -5,7 +5,6 @@ import os
 import pickle
 from contextlib import nullcontext
 import torch
-import tiktoken
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -35,8 +34,10 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     gptconf = GPTConfig(**checkpoint['model_args'])
+    if gptconf.bidirectional:
+        raise ValueError("This is a masked model. Use fill_mask.py instead of causal generation.")
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -69,6 +70,7 @@ if load_meta:
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
+    import tiktoken
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)

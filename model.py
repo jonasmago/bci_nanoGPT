@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from position import FourierXYZ, RotaryPositions
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -41,15 +42,14 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.flash = config.use_sdpa and hasattr(F, 'scaled_dot_product_attention')
+        self.bidirectional = config.bidirectional
+        self.rotary = None
+        if config.position_encoding == 'rope':
+            self.rotary = RotaryPositions(config.n_embd // config.n_head,
+                spatial=config.channel_encoding in ('rope', 'rope_fourier'), dims=config.rope_dims)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None, rotary_tables=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,14 +58,22 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.rotary is not None:
+            q, k = self.rotary.apply_rotary(q, k, rotary_tables)
+
+        allowed = attention_mask
+        causal = not self.bidirectional
+
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=causal and allowed is None)
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if allowed is None and causal:
+                allowed = torch.ones(T, T, device=x.device, dtype=torch.bool).tril()
+            if allowed is not None:
+                att = att.masked_fill(~allowed, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -95,13 +103,13 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias) #JM rescale each 384-vector to zero mean
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, attention_mask=None, rotary_tables=None):
+        x = x + self.attn(self.ln_1(x), attention_mask, rotary_tables)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -114,6 +122,13 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bidirectional: bool = False # False: causal next-token (GPT). True: masked prediction (BERT)
+    position_encoding: str = 'learned' # 'learned' wpe table (original) or 'rope' on the time axis
+    channel_encoding: str = 'none' # EEG electrode identity: none, learned, fourier, rope, rope_fourier
+    channel_vocab_size: int = 0 # size of the channel-name table for channel_encoding='learned' (UNK=0)
+    mask_token_id: int = -1 # id of the MASK input symbol; -1 for causal models
+    rope_dims: str = '' # head dims per axis 't,x,y,z', e.g. '32,8,8,8'; '' = automatic
+    use_sdpa: bool = True # False keeps the explicit attention path for inspection
 
 class GPT(nn.Module):
 
@@ -122,14 +137,29 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        if config.position_encoding not in ('learned', 'rope'):
+            raise ValueError("position_encoding must be 'learned' or 'rope'")
+        if config.channel_encoding not in ('none', 'learned', 'fourier', 'rope', 'rope_fourier'):
+            raise ValueError("Unknown channel_encoding")
+        if config.channel_encoding in ('rope', 'rope_fourier') and config.position_encoding != 'rope':
+            raise ValueError("4D channel encoding requires position_encoding='rope'")
+        if not -1 <= config.mask_token_id < config.vocab_size:
+            raise ValueError("mask_token_id must be -1 or a reserved vocabulary entry")
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        # Keep original module/parameter ordering for legacy AdamW checkpoints.
+        modules = dict(wte=nn.Embedding(config.vocab_size, config.n_embd))
+        if config.position_encoding == 'learned':
+            modules['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        modules.update(drop=nn.Dropout(config.dropout),
+                       h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                       ln_f=LayerNorm(config.n_embd, bias=config.bias))
+        self.transformer = nn.ModuleDict(modules)
+        if config.channel_encoding == 'learned':
+            if config.channel_vocab_size < 1:
+                raise ValueError("Learned channel encoding requires a channel vocabulary")
+            self.transformer['channel_embed'] = nn.Embedding(config.channel_vocab_size, config.n_embd)
+        if config.channel_encoding in ('fourier', 'rope_fourier'):
+            self.transformer['xyz_embed'] = FourierXYZ(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -155,7 +185,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and 'wpe' in self.transformer:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -167,30 +197,165 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    def _inputs(self, idx, xyz=None, times=None, channel_ids=None, valid_mask=None, validate=True):
+        if idx.ndim not in (2, 3):
+            raise ValueError("Expected token IDs [B,T] or EEG grid [B,C,T]")
+        grid = idx.ndim == 3
+        B, T = idx.shape[0], idx.shape[-1]
+        C = idx.shape[1] if grid else 1
+        L = C * T
+        if T == 0 or C == 0 or L > self.config.block_size:
+            raise ValueError(f"Sequence has {L} positions, budget is {self.config.block_size}")
+        flat = idx.reshape(B, L)
+        if valid_mask is not None:
+            if valid_mask.shape != idx.shape:
+                raise ValueError("valid_mask must match token IDs")
+            valid_mask = valid_mask.to(device=idx.device, dtype=torch.bool).reshape(B, L)
+        if times is None:
+            times = torch.arange(T, device=idx.device, dtype=torch.float32).expand(B, T)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            times = times.to(device=idx.device, dtype=torch.float32)
+            if times.shape == (T,):
+                times = times.expand(B, T)
+            if times.shape != (B, T) or (validate and not torch.isfinite(times).all()):
+                raise ValueError("times must be finite [T] or [B,T] frame positions")
+            if validate and T > 1 and (times[:, 1:] < times[:, :-1]).any():
+                raise ValueError("Time frames must be nondecreasing")
+            times = times - times[:, :1]
+        spatial = self.config.channel_encoding in ('fourier', 'rope', 'rope_fourier')
+        if spatial and xyz is None:
+            raise ValueError("This channel_encoding requires electrode xyz in head metres")
+        if xyz is None:
+            xyz = torch.zeros(B, C, 3, device=idx.device)
+        else:
+            xyz = xyz.to(device=idx.device, dtype=torch.float32)
+            if xyz.shape == (C, 3):
+                xyz = xyz.expand(B, C, 3)
+            if xyz.shape != (B, C, 3) or (validate and not torch.isfinite(xyz).all()):
+                raise ValueError("xyz must be finite [B,C,3] head coordinates in metres")
+        # Channel-major storage matches the tokenizer. Coordinates, not flattened
+        # offsets, identify simultaneous frames and physical channel positions.
+        t = times[:, None, :].expand(B, C, T)
+        space = xyz[:, :, None, :].expand(B, C, T, 3)
+        positions = torch.cat((t.unsqueeze(-1), space), dim=-1).reshape(B, L, 4)
+        ids = None
+        if self.config.channel_encoding == 'learned':
+            if channel_ids is None or channel_ids.shape != (B, C):
+                raise ValueError("Learned channel encoding requires channel_ids [B,C]")
+            ids = channel_ids.to(device=idx.device, dtype=torch.long)
+            if validate and ((ids < 0).any() or (ids >= self.config.channel_vocab_size).any()):
+                raise ValueError("channel_ids are outside the training channel vocabulary (UNK=0)")
+            ids = ids[:, :, None].expand(B, C, T).reshape(B, L)
+        return flat, positions, ids, valid_mask, grid
 
+    def encode(self, idx, *, xyz=None, times=None, channel_ids=None, valid_mask=None, validate_inputs=True):
+        """Return contextual features [...,D] without constructing vocabulary logits."""
+        flat, positions, ids, valid, grid = self._inputs(idx, xyz, times, channel_ids, valid_mask, validate_inputs)
+        x = self.transformer.wte(flat)
+        if 'wpe' in self.transformer:
+            temporal = positions[..., 0]
+            if validate_inputs and ((temporal != temporal.round()).any() or (temporal >= self.config.block_size).any()):
+                raise ValueError("Learned positions require integer frame indices within block_size")
+            x = x + self.transformer.wpe(temporal.long())
+        if 'channel_embed' in self.transformer:
+            x = x + self.transformer.channel_embed(ids)
+        if 'xyz_embed' in self.transformer:
+            # Position is constant over time within each electrode; project it once.
+            B, T = idx.shape[0], idx.shape[-1]
+            spatial = positions.reshape(B, -1, T, 4)[:, :, 0, 1:]
+            embedding = self.transformer.xyz_embed(spatial)
+            x = x + embedding[:, :, None, :].expand(-1, -1, T, -1).reshape_as(x)
+        x = self.transformer.drop(x)
+        if valid is not None:
+            x = x * valid.unsqueeze(-1)
+        # Tables and visibility are identical in every layer. Build each once.
+        rotary = self.transformer.h[0].attn.rotary
+        rotary_tables = rotary.prepare(positions) if rotary is not None else None
+        allowed = self._attention_mask(positions, valid, grid)
+        for block in self.transformer.h:
+            x = block(x, allowed, rotary_tables)
+        x = self.transformer.ln_f(x)
+        if valid is not None:
+            x = x * valid.unsqueeze(-1)
+        return x.reshape(*idx.shape, self.config.n_embd)
+
+    def _attention_mask(self, positions, valid, grid):
+        length = positions.shape[1]
+        allowed = None
+        if not self.config.bidirectional:
+            if grid:
+                times = positions[..., 0]
+                allowed = (times[:, :, None] >= times[:, None, :]).unsqueeze(1)
+            elif valid is not None:
+                allowed = torch.ones(length, length, device=positions.device, dtype=torch.bool).tril()[None, None]
+        if valid is not None:
+            keys = valid[:, None, None, :]
+            allowed = keys if allowed is None else allowed & keys
+            fallback = torch.arange(length, device=positions.device).eq(0).view(1, 1, 1, length)
+            allowed = allowed | (~allowed.any(dim=-1, keepdim=True) & fallback)
+        return allowed
+
+    def pool_features(self, idx, **kwargs):
+        """Validity-aware mean pooling for a frozen downstream linear probe."""
+        hidden = self.encode(idx, **kwargs).reshape(idx.shape[0], -1, self.config.n_embd)
+        valid = kwargs.get('valid_mask')
+        if valid is None:
+            return hidden.mean(dim=1)
+        count = valid.to(hidden.device).reshape(idx.shape[0], -1).sum(dim=1, keepdim=True).clamp_min(1)
+        return hidden.sum(dim=1) / count
+
+    def forward(self, idx, targets=None, *, xyz=None, times=None, channel_ids=None,
+                valid_mask=None, return_all_logits=False, masked_only=False,
+                score_indices=None, validate_inputs=True):
+        """CPU-built score_indices avoid dynamic boolean gathers on accelerators.
+
+        The training loader validates token IDs/coordinates before transfer and sets
+        validate_inputs=False. Public calls retain value checks by default.
+        """
+        hidden = self.encode(idx, xyz=xyz, times=times, channel_ids=channel_ids,
+                             valid_mask=valid_mask, validate_inputs=validate_inputs)
+        labels = None
+        if targets is not None:
+            if targets.shape != idx.shape:
+                raise ValueError("targets must match token IDs")
+            targets = targets.to(idx.device)
+            if valid_mask is not None:
+                targets = targets.masked_fill(~valid_mask.to(device=idx.device, dtype=torch.bool), -1)
+            if validate_inputs and self.config.mask_token_id >= 0 and (targets == self.config.mask_token_id).any():
+                raise ValueError("MASK is an input symbol, never a prediction target")
+        elif masked_only or score_indices is not None:
+            raise ValueError("Scored-position output requires targets")
+        if masked_only:
+            if score_indices is None:
+                # Convenience for interactive calls; training supplies these from CPU.
+                score_indices = (targets.reshape(-1) != -1).nonzero(as_tuple=True)[0]
+            score_indices = score_indices.to(device=idx.device, dtype=torch.long)
+            labels = targets.reshape(-1).index_select(0, score_indices)
+            selected = hidden.reshape(-1, hidden.shape[-1]).index_select(0, score_indices)
+        elif targets is None and not return_all_logits and not self.config.bidirectional and idx.ndim == 2:
+            selected = hidden[:, [-1], :]
+        else:
+            selected = hidden
+            if targets is not None:
+                labels = targets.reshape(-1)
+        logits = self.lm_head(selected)
+        if self.config.mask_token_id >= 0:
+            logits = logits.clone()
+            logits.select(-1, self.config.mask_token_id).fill_(float('-inf'))
+        loss = None
+        if labels is not None:
+            # Sum + tensor denominator stays finite for an entirely ignored batch
+            # without a GPU-to-host truth-value check or a dynamic label gather.
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels,
+                                   ignore_index=-1, reduction='sum') / (labels != -1).sum().clamp_min(1)
         return logits, loss
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        # Original manual attention checkpoints stored a triangular buffer. It is
+        # regenerated from current times/validity now and carries no learned state.
+        state_dict = {k: v for k, v in state_dict.items()
+                      if not k.endswith(('.attn.bias', '.attn.masked_bias'))}
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -198,7 +363,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if 'wpe' in self.transformer:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -309,6 +475,12 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if self.config.bidirectional:
+            raise ValueError("generate() is for causal models; use fill_mask.py for masked text")
+        if idx.ndim != 2 or self.config.channel_encoding != 'none':
+            raise ValueError("generate() supports flat causal streams; EEG uses next-frame evaluation")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]

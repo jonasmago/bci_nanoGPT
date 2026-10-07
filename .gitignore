@@ -10,3 +10,10 @@ __pycache__/
 input.txt
 env/
 venv/
+# this fork: generated data and runs
+wandb/
+out*/
+data/*/train/
+data/*/val/
+data/*/manifest.json
+*.npz
