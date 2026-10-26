@@ -9,11 +9,14 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import os # #jm: JM_PDB=1 env var stops in GPT.forward to inspect the position vectors
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+from position import RotaryPositions # #jm rope4d (ported from branch eeg-reference)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -41,31 +44,41 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.causal = not config.bidirectional
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        if not self.flash and self.causal:
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None, rope=None):
+        # attn_mask: optional bool [B, 1, 1, T], True where a position may be attended to (used to hide padding)
+        # rope: #jm optional (cos, sin) of shape [B, 1, T, R] from rope4d_cos_sin(); rotates the first R dims of q and k
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate query, query, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if rope is not None: # #jm rope4d: relative (time, x, y, z) enters through the q.k dot product
+            rotary, tables = rope
+            q, k = rotary.apply_rotary(q, k, tables)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if self.causal: # bidirectional models attend to every position, so no mask
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if attn_mask is not None:
+                att = att.masked_fill(~attn_mask, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -100,8 +113,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, attn_mask=None, rope=None):
+        x = x + self.attn(self.ln_1(x), attn_mask, rope) # #jm rope = (RotaryPositions, cos/sin tables) or None
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -114,6 +127,17 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bidirectional: bool = False # False: causal next-token prediction (GPT). True: masked prediction (BERT), every position sees the whole sequence
+    mask_token_id: int = -1 # id of the MASK input symbol for bidirectional models; -1 for causal models
+    channel_encoding: str = 'none' # EEG grids: how a token knows its channel. 'none' | 'learned' (one embedding per channel name)
+                                   # | 'rope4d' (#jm: axial RoPE over (frame, x, y, z) in every attention layer, position.py;
+                                   #   REPLACES the wpe table, so time is relative too — the eeg-reference 'rope' design)
+    channel_vocab_size: int = 0 # number of channel names for channel_encoding='learned' (id 0 = unknown)
+    rope_dims: str = '32,8,8,8' # #jm rope4d only: head dims rotated by frame index, x, y, z (sum <= head size; rest unrotated)
+    token_input: str = 'embedding' # #jm 2026-10-23: 'embedding' = learned table per token id (wte, the original);
+                                   # 'codebook' = the token's DAC codebook VECTOR (unit-normalised, frozen buffer `codebook`)
+                                   #   through a learned Linear(codebook_dim, n_embd); the MASK token gets its own learned vector.
+    codebook_dim: int = 0 # #jm token_input='codebook' only: length of a codebook vector (8 for our DAC runs)
 
 class GPT(nn.Module):
 
@@ -130,15 +154,31 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        if config.token_input == 'codebook': # #jm: tokens enter as their codebook vectors, not as ids
+            assert config.codebook_dim > 0, "token_input='codebook' needs codebook_dim"
+            del self.transformer['wte']
+            n_codes = config.mask_token_id if config.mask_token_id >= 0 else config.vocab_size # the MASK id has no codebook row
+            self.register_buffer('codebook', torch.zeros(n_codes, config.codebook_dim)) # filled by set_codebook / the checkpoint
+            self.transformer['in_proj'] = nn.Linear(config.codebook_dim, config.n_embd)
+            self.mask_emb = nn.Parameter(torch.zeros(config.n_embd))
+        if config.channel_encoding == 'learned':
+            # a second position table: wpe says WHEN a token is, wce says WHERE (which electrode); both are added to the token
+            self.transformer['wce'] = nn.Embedding(config.channel_vocab_size, config.n_embd)
+        if config.channel_encoding == 'rope4d': # #jm: no position tables at all; (t, x, y, z) rotate q and k in every layer
+            del self.transformer['wpe']
+            self.rotary = RotaryPositions(config.n_embd // config.n_head, spatial=True, dims=config.rope_dims)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if 'wte' in self.transformer: # #jm: no table to tie with when the input is the codebook vector
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
+        if config.token_input == 'codebook': # #jm
+            torch.nn.init.normal_(self.mask_emb, mean=0.0, std=0.02)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -155,7 +195,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and 'wpe' in self.transformer: # #jm rope4d has no wpe
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -167,29 +207,67 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    @torch.no_grad()
+    def set_codebook(self, codebook): # #jm: the DAC codebook [n_codes, codebook_dim]; rows unit-normalised (the quantizer's own metric)
+        assert self.config.token_input == 'codebook' and tuple(codebook.shape) == tuple(self.codebook.shape), (codebook.shape, self.codebook.shape)
+        self.codebook.copy_(F.normalize(codebook.float(), dim=1).to(self.codebook.device))
+
+    def token_vectors(self, idx):
+        """#jm: what the transformer receives for every token id, [..., n_embd] — the learned embedding (token_input='embedding')
+        or the projected codebook vector, with the learned MASK vector where idx == mask_token_id (token_input='codebook')."""
+        if self.config.token_input != 'codebook':
+            return self.transformer.wte(idx)
+        x = self.transformer.in_proj(self.codebook[idx.clamp(max=self.codebook.shape[0] - 1)])
+        if self.config.mask_token_id >= 0:
+            x = torch.where((idx == self.config.mask_token_id).unsqueeze(-1), self.mask_emb.to(x.dtype), x)
+        return x
+
+    def forward(self, idx, targets=None, channel_ids=None, valid_mask=None, xyz=None, return_hidden=False):
+        # idx is either text [b, t] or an EEG grid [b, c, t] (c channels, t frames). A grid is flattened
+        # channel by channel into one sequence of c*t tokens; each token keeps its frame index for wpe and,
+        # with channel_encoding='learned', its channel id for wce. valid_mask [b, c, t] marks padded channels.
+        # #jm xyz [b, c, 3] (head metres) feeds channel_encoding='rope4d'; return_hidden=True returns the final
+        # hidden states [b, c*t, n_embd] instead of (logits, loss) (used by the classification probe).
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        b, t = idx.shape[0], idx.shape[-1]
+        c = idx.shape[1] if idx.ndim == 3 else 1
+        assert c * t <= self.config.block_size, f"Cannot forward sequence of length {c * t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).repeat(c) # frame index of every flattened token, shape (c*t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.token_vectors(idx.reshape(b, c * t)) # token embeddings of shape (b, c*t, n_embd)  (#jm: wte or codebook vectors)
+        import pdb; pdb.set_trace()
+        if 'wpe' in self.transformer: # #jm: absent for rope4d
+            x = x + self.transformer.wpe(pos) # position embeddings of shape (c*t, n_embd)
+        if 'wce' in self.transformer:
+            x = x + self.transformer.wce(channel_ids.repeat_interleave(t, dim=1)) # channel embeddings, shape (b, c*t, n_embd)
+        rope = None
+        if self.config.channel_encoding == 'rope4d': # #jm: (frame, x, y, z) of every flattened token -> cos/sin tables once per forward
+            assert xyz is not None, "channel_encoding='rope4d' needs xyz [b, c, 3] in head metres"
+            coords = torch.cat([pos.view(1, c * t, 1).expand(b, -1, -1).float(),
+                                xyz.float().repeat_interleave(t, dim=1)], dim=-1) # [b, c*t, 4]
+            rope = (self.rotary, self.rotary.prepare(coords))
+        x = self.transformer.drop(x)
+        attn_mask = valid_mask.reshape(b, 1, 1, c * t) if valid_mask is not None else None # padded channels are never attended to
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, attn_mask, rope)
         x = self.transformer.ln_f(x)
+        if return_hidden: # #jm
+            return x
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+        elif self.config.bidirectional:
+            # every position is a prediction (the masked ones are the interesting ones)
+            logits = self.lm_head(x).reshape(*idx.shape, -1)
+            loss = None
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
+            
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -198,7 +276,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if 'wpe' in self.transformer: # #jm rope4d has no wpe
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -309,6 +388,7 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        assert not self.config.bidirectional, "generate() is for causal models; use fill_mask.py for masked models"
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -322,7 +402,7 @@ class GPT(nn.Module):
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+            # sample from thea distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)

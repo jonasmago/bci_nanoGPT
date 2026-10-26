@@ -1,0 +1,20 @@
+[11:55:01] smoke
+  ssvep fold 4: test subjects ['sub-01', 'sub-06'] acc 7.5 (last train loss 2.60)
+  ssvep: 9.1 +- 1.8 over 10 held-out subjects (36s)
+  raw-signal reference (ssvep, cross-subject): 74.2 +- 23.3
+wrote /data/groups/bci/jonas/workspace/bci_nanoGPT/jm_finetune_results.csv
+[11:55:44] multichannel-rope4d 
+  ssvep: 24.4 +- 10.2 over 10 held-out subjects (177s)
+  raw-signal reference (ssvep, cross-subject): 74.2 +- 23.3
+  fist_lr: 48.8 +- 2.4 over 13 held-out subjects (695s)
+  raw-signal reference (fist_lr, cross-subject): 55.2 +- 9.6
+[12:10:30] multichannel-rope4d --random_init
+  ssvep: 25.0 +- 11.4 over 10 held-out subjects (76s)
+  fist_lr: 53.1 +- 7.0 over 13 held-out subjects (517s)
+[12:20:30] multichannel-none
+  ssvep: 31.3 +- 13.4 over 10 held-out subjects (189s)
+  fist_lr: 53.7 +- 4.6 over 13 held-out subjects (606s)
+[12:33:50] chris512-rope4d
+  ssvep: 16.4 +- 3.6 over 10 held-out subjects (176s)
+  fist_lr: 50.0 +- 4.1 over 13 held-out subjects (688s)
+[12:48:20] FINETUNE_DONE

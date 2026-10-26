@@ -1,0 +1,11 @@
+out_dir,dataset,channel_encoding,init,steps,task,acc,std,n_subjects
+out-jm/multichannel-rope4d,eeg_dac_multichannel,rope4d,pretrained,300,ssvep,24.38888888888889,10.21512434736351,10
+raw,,,raw signal,0,ssvep,74.16666666666666,23.34424348107481,10
+out-jm/multichannel-rope4d,eeg_dac_multichannel,rope4d,pretrained,300,fist_lr,48.80341880341881,2.4053414152940653,13
+raw,,,raw signal,0,fist_lr,55.17094017094016,9.581421499834152,13
+out-jm/multichannel-rope4d,eeg_dac_multichannel,rope4d,random,300,ssvep,25.0,11.417984514369003,10
+out-jm/multichannel-rope4d,eeg_dac_multichannel,rope4d,random,300,fist_lr,53.11965811965812,6.985055481028862,13
+out-jm/multichannel-none,eeg_dac_multichannel,none,pretrained,300,ssvep,31.333333333333336,13.444444444444445,10
+out-jm/multichannel-none,eeg_dac_multichannel,none,pretrained,300,fist_lr,53.717948717948715,4.639852836970929,13
+out-jm/chris512-rope4d,eeg_dac_chris512,rope4d,pretrained,300,ssvep,16.38888888888889,3.6025539637496613,10
+out-jm/chris512-rope4d,eeg_dac_chris512,rope4d,pretrained,300,fist_lr,50.0,4.134491152973616,13

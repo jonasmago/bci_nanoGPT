@@ -17,3 +17,4 @@ data/*/train/
 data/*/val/
 data/*/manifest.json
 *.npz
+data/eeg_dac_*/

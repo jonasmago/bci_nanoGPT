@@ -1,0 +1,19 @@
+[20:16:45] preparing eeg_dac_vocab512
+[val 8/8] ds007137/sub-3001: 29 ch x 4800 frames (7s)
+wrote dataset to data/eeg_dac_vocab512
+[20:17:35] preparing eeg_dac_rvq2x512c0
+[val 8/8] ds007137/sub-3001: 29 ch x 4800 frames (7s)
+wrote dataset to data/eeg_dac_rvq2x512c0
+[20:18:22] train out-jm/vocab512-rope4d-time
+[20:24:21] trained (exit 0)
+[20:25:05] probed (exit 0)
+[20:25:05] train out-jm/vocab512-rope4d-random
+[20:30:48] trained (exit 0)
+[20:31:31] probed (exit 0)
+[20:31:31] train out-jm/rvq2x512c0-rope4d-time
+[20:37:09] trained (exit 0)
+[20:37:51] probed (exit 0)
+[20:37:51] train out-jm/rvq2x512c0-rope4d-random
+[20:43:41] trained (exit 0)
+[20:44:24] probed (exit 0)
+[20:44:24] SWEEP6_TOKENIZERS_DONE

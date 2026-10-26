@@ -1,0 +1,19 @@
+[11:53:30] start out-jm/mask-time-r0.5-s8 on GPU 5
+[11:53:30] start out-jm/mask-random-r0.5-s32 on GPU 4
+[11:53:30] start out-jm/mask-channel-r0.5-s32 on GPU 4
+[11:53:30] start out-jm/mask-mixed-r0.5-s32 on GPU 5
+[12:00:47] trained out-jm/mask-mixed-r0.5-s32 (exit 0)
+[12:00:51] trained out-jm/mask-time-r0.5-s8 (exit 0)
+[12:00:57] trained out-jm/mask-channel-r0.5-s32 (exit 0)
+[12:00:57] trained out-jm/mask-random-r0.5-s32 (exit 0)
+[12:01:44] probed out-jm/mask-mixed-r0.5-s32 (exit 0)
+[12:01:44] start out-jm/mask-time-r0.25-s32 on GPU 4
+[12:01:55] trained out-jm/mask-time-r0.25-s32 (exit 0)
+[12:01:57] probed out-jm/mask-time-r0.25-s32 (exit 0)
+[12:01:57] start out-jm/mask-time-r0.75-s32 on GPU 5
+[12:02:00] probed out-jm/mask-channel-r0.5-s32 (exit 0)
+[12:02:20] probed out-jm/mask-time-r0.5-s8 (exit 0)
+[12:02:22] probed out-jm/mask-random-r0.5-s32 (exit 0)
+[12:06:27] trained out-jm/mask-time-r0.75-s32 (exit 0)
+[12:07:11] probed out-jm/mask-time-r0.75-s32 (exit 0)
+[12:07:11] MASK_SWEEP_DONE

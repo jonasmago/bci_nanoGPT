@@ -1,0 +1,37 @@
+[11:02:52] start out-jm/multichannel-learned on GPU 5
+[11:02:52] start out-jm/multichannel-rope4d on GPU 6
+[11:02:52] start out-jm/multichannel-none on GPU 4
+[11:02:52] start out-jm/noPost8192-none on GPU 6
+[11:07:02] trained out-jm/multichannel-learned (exit 0)
+[11:07:38] probed out-jm/multichannel-learned (exit 0)
+[11:07:38] start out-jm/noPost8192-learned on GPU 4
+[11:07:41] trained out-jm/multichannel-none (exit 0)
+[11:08:15] probed out-jm/multichannel-none (exit 0)
+[11:08:15] start out-jm/noPost8192-rope4d on GPU 5
+[11:09:09] trained out-jm/noPost8192-none (exit 0)
+[11:09:19] trained out-jm/multichannel-rope4d (exit 0)
+[11:09:44] probed out-jm/noPost8192-none (exit 0)
+[11:09:44] start out-jm/corrupt4v3-none on GPU 6
+[11:09:53] probed out-jm/multichannel-rope4d (exit 0)
+[11:09:53] start out-jm/corrupt4v3-learned on GPU 6
+[11:12:21] trained out-jm/noPost8192-learned (exit 0)
+[11:12:56] probed out-jm/noPost8192-learned (exit 0)
+[11:12:56] start out-jm/corrupt4v3-rope4d on GPU 4
+[11:13:06] trained out-jm/noPost8192-rope4d (exit 0)
+[11:13:42] probed out-jm/noPost8192-rope4d (exit 0)
+[11:13:42] start out-jm/chris512-none on GPU 5
+[11:16:03] trained out-jm/corrupt4v3-none (exit 0)
+[11:16:11] trained out-jm/corrupt4v3-learned (exit 0)
+[11:16:35] probed out-jm/corrupt4v3-none (exit 0)
+[11:16:35] start out-jm/chris512-learned on GPU 6
+[11:16:44] probed out-jm/corrupt4v3-learned (exit 0)
+[11:16:44] start out-jm/chris512-rope4d on GPU 6
+[11:17:40] trained out-jm/corrupt4v3-rope4d (exit 0)
+[11:17:55] trained out-jm/chris512-none (exit 0)
+[11:18:17] probed out-jm/corrupt4v3-rope4d (exit 0)
+[11:18:32] probed out-jm/chris512-none (exit 0)
+[11:22:59] trained out-jm/chris512-learned (exit 0)
+[11:23:28] trained out-jm/chris512-rope4d (exit 0)
+[11:23:37] probed out-jm/chris512-learned (exit 0)
+[11:24:01] probed out-jm/chris512-rope4d (exit 0)
+[11:24:01] JM_SWEEP_DONE

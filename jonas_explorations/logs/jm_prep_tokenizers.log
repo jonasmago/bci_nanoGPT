@@ -1,0 +1,13 @@
+[10:54:50] preparing eeg_dac_noPost8192
+[val 7/8] ds005280/sub-073: 63 ch x 4241 frames (6s)
+[val 8/8] ds007137/sub-3001: 29 ch x 4800 frames (6s)
+wrote dataset to data/eeg_dac_noPost8192
+[10:55:34] preparing eeg_dac_corrupt4v3
+[val 7/8] ds005280/sub-073: 63 ch x 4241 frames (5s)
+[val 8/8] ds007137/sub-3001: 29 ch x 4800 frames (5s)
+wrote dataset to data/eeg_dac_corrupt4v3
+[10:56:13] preparing eeg_dac_chris512
+[val 7/8] ds005280/sub-073: 63 ch x 4241 frames (4s)
+[val 8/8] ds007137/sub-3001: 29 ch x 4800 frames (5s)
+wrote dataset to data/eeg_dac_chris512
+[10:56:48] PREP_DONE

@@ -1,0 +1,7 @@
+[11:46:47] preparing 400+40 recordings
+[val 39/40] tuh/tuh_eeg/aaaaaqtb: 21 ch x 4800 frames (21s)
+[val 40/40] ds004902/sub-11: 61 ch x 2400 frames (21s)
+wrote dataset to data/eeg_dac_1024_big
+[11:51:09] training out-jm/big1024-rope4d-15k
+[12:18:25] trained (exit 0)
+[12:19:26] BIGDATA_DONE
