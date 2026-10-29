@@ -56,6 +56,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 use_codebook = False # True: feed each token's DAC codebook vector (data/<dataset>/codebook.npy) instead of a learned embedding
 eeg_dataloader = False # True: windows from data/<dataset>/{train,val}/*.npz, never across channels, recordings or 60 s chunks
+pos_encoding = 'learned' # 'learned' (wpe, original) | 'sinusoidal' (fixed sin/cos table)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -167,7 +168,8 @@ if use_codebook: #jm
     codebook = torch.nn.functional.normalize(codebook, dim=1)   # unit length: the DAC compares codes by direction
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, #jm
                   bias=bias, vocab_size=None, dropout=dropout,
-                  codebook_dim=codebook.shape[1] if codebook is not None else 0) # start with model_args from command line
+                  codebook_dim=codebook.shape[1] if codebook is not None else 0,
+                  pos_encoding=pos_encoding)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")

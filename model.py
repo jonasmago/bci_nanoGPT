@@ -105,6 +105,14 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+def sinusoidal_table(n_positions, dim):   #jm
+    """(n_positions, dim) fixed position vectors: sin and cos of the position at dim/2 geometric frequencies; unit length per row."""
+    pos = torch.arange(n_positions, dtype=torch.float32)[:, None]               # (n, 1)
+    freq = 10000 ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)     # (dim/2,) from 1 down to ~1/10000
+    angles = pos * freq                                                       # (n, dim/2)
+    table = torch.cat([angles.sin(), angles.cos()], dim=1)                    # (n, dim)
+    return F.normalize(table, dim=1)                                          # each row length 1, comparable to the token vectors
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -115,6 +123,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     codebook_dim: int = 0 #jm 0 = learned wte table (original); >0 = tokens enter as their DAC codebook vector (this many dims)
+    pos_encoding: str = 'learned' #jm 'learned' = wpe table (original); 'sinusoidal' = fixed sin/cos table, nothing learned
 
 class GPT(nn.Module):
 
@@ -136,6 +145,9 @@ class GPT(nn.Module):
             del self.transformer['wte']                                   # no learned table per id any more
             self.register_buffer('codebook', torch.zeros(config.vocab_size, config.codebook_dim))  # frozen, filled from codebook.npy
             self.in_proj = nn.Linear(config.codebook_dim, config.n_embd)  # the learned 8 -> 384 map
+        if config.pos_encoding == 'sinusoidal': #jm
+            del self.transformer['wpe']                                                   # no learned position table
+            self.register_buffer('pos_table', sinusoidal_table(config.block_size, config.n_embd))  # fixed, (block_size, n_embd) 
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -163,7 +175,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and 'wpe' in self.transformer:   #jm no wpe for sinusoidal        
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -186,7 +198,10 @@ class GPT(nn.Module):
             tok_emb = self.in_proj(self.codebook[idx])   # (b, t) ids -> (b, t, 8) code vectors -> (b, t, n_embd)
         else:
             tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        if self.config.pos_encoding == 'sinusoidal': #jm
+            pos_emb = self.pos_table[pos]                  # (t, n_embd), same lookup, fixed values
+        else:            
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -209,7 +224,9 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+
+        if 'wpe' in self.transformer:   #jm        
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
