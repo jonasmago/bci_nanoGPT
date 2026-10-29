@@ -37,3 +37,4 @@ warmup_iters = 100 # not super necessary potentially
 # compile = False # do not torch compile the model
 
 use_codebook = True   #jm tokens enter as their DAC codebook vectors (data/<dataset>/codebook.npy)
+eeg_dataloader = True   #jm windows from the per-recording grids
