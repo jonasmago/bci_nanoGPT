@@ -54,6 +54,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+use_codebook = False # True: feed each token's DAC codebook vector (data/<dataset>/codebook.npy) instead of a learned embedding
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -144,8 +145,13 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+codebook = None
+if use_codebook: #jm
+    codebook = torch.from_numpy(np.load(os.path.join(data_dir, 'codebook.npy'))).float()   # (8192, 8)
+    codebook = torch.nn.functional.normalize(codebook, dim=1)   # unit length: the DAC compares codes by direction
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, #jm
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  codebook_dim=codebook.shape[1] if codebook is not None else 0) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -155,6 +161,8 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    if codebook is not None: #jm
+        model.codebook.copy_(codebook)   # fill the frozen buffer with the DAC's vectors
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
