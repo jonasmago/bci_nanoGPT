@@ -144,6 +144,14 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+#jm unigram baseline: bits per token of a model that only knows how often each token occurs (val split)
+_val = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+_p = np.bincount(_val, minlength=meta_vocab_size or 0).astype(np.float64) / len(_val)
+_p = _p[_p > 0]
+unigram_bits = float(-(_p * np.log2(_p)).sum())
+config['unigram_bits'] = unigram_bits   # stored with the wandb run
+print(f"unigram baseline: {unigram_bits:.2f} bits per token")
+
 # model init
 codebook = None
 if use_codebook: #jm
@@ -276,6 +284,8 @@ while True:
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "val/bits": losses['val'] / math.log(2),
+                "val/bits_saved": unigram_bits - losses['val'] / math.log(2),
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
