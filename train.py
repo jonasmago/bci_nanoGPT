@@ -128,7 +128,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = dataset if os.path.isabs(dataset) else os.path.join('data', dataset)   #jm 'eeg_multi' -> data/eeg_multi; an absolute path (e.g. under processed/dac_tokens/) is used as is
 if eeg_dataloader:
     from eeg_dataloader import EEGDataLoader, EEGLabelledLoader
     np.random.seed(seed + seed_offset)   # the loader samples with numpy; torch.manual_seed above does not cover it
