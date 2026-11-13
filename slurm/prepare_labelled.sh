@@ -2,7 +2,7 @@
 # Tokenize the labelled NeuralBench pilot sets for the classifier, one GPU per dataset.
 #   cd ~/workspace/bci_nanoGPT/slurm && sbatch prepare_labelled.sh
 # Tokens go to /data/groups/bci/datasets/processed/dac_tokens/<DAC run>/<Study>_<task>/ (a derived dataset, not repo
-# data); train.py reads data/<name>, so data/eeg_<name> is a symlink to that folder.
+# data); pass that absolute path as --dataset to train.py.
 #SBATCH --job-name=eeg-labelled-prep
 #SBATCH --partition=dev
 #SBATCH --gres=gpu:1

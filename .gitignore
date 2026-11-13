@@ -22,6 +22,7 @@ data/*/manifest.json
 *.npy
 logs/
 slurm/logs/
-# symlinks to /data/groups/bci/datasets/processed/dac_tokens/<DAC run>/ (labelled token sets)
+# symlinks to /data/groups/bci/datasets/processed/dac_tokens/<DAC run>/ (token sets live there, not in the repo)
+data/eeg_multi
 data/eeg_*_p3
 data/eeg_*_cvep

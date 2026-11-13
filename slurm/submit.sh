@@ -78,6 +78,6 @@ $PY -u train.py $CONFIG ${ARGS[$i]} \
     --out_dir=out/$PREFIX-${NAMES[$i]//\{params\}-/}-$TAG --wandb_run_name=$PREFIX-${NAMES[$i]}-$TAG
 
 # single job instead (e.g. the token preprocessing): delete the --array line and use one plain command:
-# $PY -u data/eeg_single/prepare.py --n_train 300 --n_val 30 --out_dir data/eeg_multi
+# $PY -u data/eeg_single/prepare.py --n_train 300 --n_val 30 --out_dir /data/groups/bci/datasets/processed/dac_tokens/rand10k_baseline/eeg_multi_v8-10k_300-30
 
 echo "[$(date '+%F %T')] done"

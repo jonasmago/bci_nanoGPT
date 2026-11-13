@@ -8,7 +8,7 @@ wandb_log = True
 wandb_project = 'nanogpt-eeg'
 wandb_run_name = 'eeg-classify'
 
-dataset = 'eeg_hubner_p3'       # data/<dataset>/{windows.npz, train, val, meta.pkl, codebook.npy}: a symlink into processed/dac_tokens/
+dataset = '/data/groups/bci/datasets/processed/dac_tokens/rand10k_baseline/Hubner2016Eeg_p3'   # {windows.npz, train, val, meta.pkl, codebook.npy} from data/eeg_labelled/prepare.py
 task = 'classify'
 pretrained_ckpt = ''            # '' = labels only | out/eeg-multi-rope-d384-l6-r3/ckpt.pt (masked) | out/eeg-multi-ntp-rope-d384-l6-r4/ckpt.pt (next-token)
 freeze_backbone = False         # True = linear probe on the pretrained features
