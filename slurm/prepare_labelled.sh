@@ -10,10 +10,21 @@
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
 #SBATCH --array=0-3
-#SBATCH --output=/data/groups/bci/jonas/workspace/bci_nanoGPT/slurm/logs/%x-%A_%a.log
+#SBATCH --output=slurm/logs/%x-%A_%a.log
+
+# Switch for different users to handle directories, environments, wandb projects, etc.
+case "$USER" in
+    chris)   PY=/data/groups/bci/chris/workspace/venv_dac/bin/python 
+    #           
+    jonas)   PY=/data/groups/bci/jonas/venv_dac/bin/python 
+    #           
+    jonhuml) PY=/data/groups/bci/jonhuml/venv_dac/bin/python 
+    #
+    *)       echo "unknown user $USER: add a case in submit.sh"; exit 1 ;;
+esac
 
 set -euo pipefail
-cd /data/groups/bci/jonas/workspace/bci_nanoGPT
+cd /data/groups/bci/$USER/workspace/bci_nanoGPT
 echo "[$(date '+%F %T')] job ${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID} task ${SLURM_ARRAY_TASK_ID:-0} on $(hostname), GPU $CUDA_VISIBLE_DEVICES"
 
 PILOT=/data/groups/bci/datasets/processed/v8.1_neuralbench_pilot/tasks
@@ -23,7 +34,7 @@ NAMES=(Korczowski2019BrainBi2014B_p3                      Hubner2016Eeg_p3      
 # Hamid2020Tuar (artifact) is multilabel: not supported by prepare.py yet.
 
 i=${SLURM_ARRAY_TASK_ID:-0}
-NUMPY_MADVISE_HUGEPAGE=0 /data/groups/bci/jonas/venv_dac_audio/bin/python -u data/eeg_labelled/prepare.py \
+NUMPY_MADVISE_HUGEPAGE=0 $PY -u data/eeg_labelled/prepare.py \
     --cache ${CACHES[$i]} --out_dir $TOKENS/${NAMES[$i]}
 
 echo "[$(date '+%F %T')] done"

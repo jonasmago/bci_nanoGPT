@@ -24,8 +24,8 @@ from functools import lru_cache
 
 import numpy as np
 
-DAC_REPO = "/data/groups/bci/jonas/workspace/bci_descript-audio-codec"
-CKPT = f"{DAC_REPO}/runs/rand10k_baseline/latest/dac/weights.pth"      # Chris's parameters, 20k steps, 8192 codes
+DAC_REPO = "/data/groups/bci/checkpoints/DAC_CNN_tokenizer"
+CKPT = f"{DAC_REPO}/runs/vq_long_006/latest/dac/weights.pth"          # Chris's parameters, 60k steps, 8192 codes
 V8 = "/data/groups/bci/datasets/processed/v8_sets/10k"
 SR, HOP = 256, 32                                                      # tokens are 32 samples = 125 ms
 TARGET_STD, CLIP = 0.3, 1.0                                            # the DAC's EEGNormalize: std 0.3, clip +-1
